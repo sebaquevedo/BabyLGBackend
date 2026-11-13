@@ -1,0 +1,602 @@
+// Citera — data model v0
+// Derived from docs/product-spec.md §3. Every row that belongs to a site is scoped by
+// websiteId: that is the tenancy boundary every query must respect.
+
+generator client {
+  provider               = "prisma-client"
+  output                 = "../src/prisma/generated"
+  moduleFormat           = "esm"
+  generatedFileExtension = "ts"
+  importFileExtension    = "js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------- enums
+
+enum Role {
+  OWNER
+  ADMIN
+  EDITOR
+}
+
+enum IntegrationKind {
+  WORDPRESS
+  GOOGLE_SEARCH_CONSOLE
+  GOOGLE_ANALYTICS
+  INSTAGRAM_FACEBOOK
+  REDDIT
+  QUORA
+}
+
+enum IntegrationStatus {
+  CONNECTED
+  DISCONNECTED
+  ERROR
+}
+
+enum KeywordSource {
+  RESEARCH
+  GSC
+  COMPETITOR
+  MANUAL
+}
+
+enum PlanItemStatus {
+  QUEUED
+  RESEARCHING
+  WRITING
+  READY
+  APPROVED
+  SCHEDULED
+  PUBLISHING
+  PUBLISHED
+  FAILED
+  SKIPPED
+}
+
+enum ArticleType {
+  HOW_TO
+  EXPLAINER
+  LISTICLE
+  COMPARISON
+  NEWS
+}
+
+enum ArticleStatus {
+  DRAFT
+  PENDING_REVIEW
+  APPROVED
+  PUBLISHED
+  FAILED
+}
+
+enum Severity {
+  HIGH
+  MEDIUM
+  LOW
+}
+
+enum IssueCategory {
+  TECHNICAL_SEO
+  LLM_OPTIMIZATION
+  PERFORMANCE
+}
+
+enum SocialPlatform {
+  REDDIT
+  QUORA
+  INSTAGRAM
+  FACEBOOK
+}
+
+enum SocialStatus {
+  NEW
+  DRAFTED
+  APPROVED
+  PUBLISHED
+  DISMISSED
+}
+
+enum BacklinkStatus {
+  PROPOSED
+  ACCEPTED
+  LIVE
+  REJECTED
+}
+
+enum AssetKind {
+  LOGO
+  HERO
+  BODY_IMAGE
+  INFOGRAPHIC
+  SOCIAL_CAROUSEL
+}
+
+enum ActivityKind {
+  ARTICLE_PUBLISHED
+  TOPIC_RESEARCHED
+  ARTICLE_IMPROVED
+  BACKLINK_ADDED
+  SOCIAL_OPPORTUNITY_FOUND
+  SOCIAL_REPLIED
+  SCAN_COMPLETED
+  VISIBILITY_RUN_COMPLETED
+  FAILED
+}
+
+// ---------------------------------------------------------------- tenancy
+
+model Account {
+  id        String   @id @default(cuid())
+  name      String
+  plan      String   @default("trial")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  memberships Membership[]
+  websites    Website[]
+
+  @@map("accounts")
+}
+
+model User {
+  id           String    @id @default(cuid())
+  email        String    @unique
+  passwordHash String
+  name         String
+  locale       String    @default("es-CL")
+  lastLoginAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  memberships Membership[]
+  refreshSessions RefreshSession[]
+  approvedArticles Article[] @relation("ArticleApprovals")
+
+  @@map("users")
+}
+
+// Refresh tokens are persisted so rotation is real: a token that was already rotated is
+// recognisable, and recognising it revokes the whole family (theft detection). Never store the
+// token itself — only the SHA-256 of it.
+model RefreshSession {
+  id               String    @id @default(cuid())
+  userId           String
+  familyId         String
+  tokenHash        String    @unique
+  expiresAt        DateTime
+  revokedAt        DateTime?
+  replacedByHash   String?
+  userAgent        String?
+  ip               String?
+  createdAt        DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([familyId])
+  @@map("refresh_sessions")
+}
+
+model Membership {
+  id        String   @id @default(cuid())
+  accountId String
+  userId    String
+  role      Role     @default(EDITOR)
+  createdAt DateTime @default(now())
+
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([accountId, userId])
+  @@index([userId])
+  @@map("memberships")
+}
+
+model Website {
+  id        String   @id @default(cuid())
+  accountId String
+  name      String
+  domain    String
+  language  String   @default("es")
+  timezone  String   @default("America/Santiago")
+  // Publishing policy. Off by default is a product decision, not a preference: the reference
+  // auto-publishes and shipped articles with unvetted internal links. New articles land in
+  // PENDING_REVIEW instead.
+  autoPublish Boolean  @default(false)
+  // Integer hour (0-23) in the site's own `timezone`, never UTC.
+  publishHour Int      @default(9)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  account           Account            @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  integrations      Integration[]
+  brandProfile      BrandProfile?
+  catalogItems      CatalogItem[]
+  competitors       Competitor[]
+  clusters          Cluster[]
+  keywords          Keyword[]
+  planItems         ContentPlanItem[]
+  articles          Article[]
+  siteScans         SiteScan[]
+  aiPrompts         AiPrompt[]
+  socialOpportunities SocialOpportunity[]
+  backlinkAccount   BacklinkAccount?
+  backlinkExchanges BacklinkExchange[]
+  assets            Asset[]
+  activities        ActivityLog[]
+
+  @@unique([accountId, domain])
+  @@map("websites")
+}
+
+// ---------------------------------------------------------------- integrations
+
+model Integration {
+  id           String            @id @default(cuid())
+  websiteId    String
+  kind         IntegrationKind
+  status       IntegrationStatus @default(DISCONNECTED)
+  // Credentials are encrypted at rest by the application before they land here.
+  credentials  Json?
+  meta         Json?
+  lastSyncAt   DateTime?
+  lastError    String?
+  createdAt    DateTime          @default(now())
+  updatedAt    DateTime          @updatedAt
+
+  website Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  @@unique([websiteId, kind])
+  @@map("integrations")
+}
+
+// ---------------------------------------------------------------- brand & catalog
+
+model BrandProfile {
+  id             String   @id @default(cuid())
+  websiteId      String   @unique
+  positioning    String?  @db.Text
+  voiceSourceUrl String?
+  logoAssetId    String?
+  colorPrimary   String?
+  colorSecondary String?
+  updatedAt      DateTime @updatedAt
+
+  website Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  @@map("brand_profiles")
+}
+
+model CatalogItem {
+  id         String   @id @default(cuid())
+  websiteId  String
+  name       String
+  kind       String   @default("service")
+  url        String?
+  priceCents Int?
+  currency   String   @default("CLP")
+  extractedAt DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  website Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  @@index([websiteId])
+  @@map("catalog_items")
+}
+
+model Competitor {
+  id        String   @id @default(cuid())
+  websiteId String
+  domain    String
+  createdAt DateTime @default(now())
+
+  website Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  @@unique([websiteId, domain])
+  @@map("competitors")
+}
+
+model Asset {
+  id        String    @id @default(cuid())
+  websiteId String
+  kind      AssetKind
+  url       String
+  alt       String?
+  source    String    @default("generated")
+  meta      Json?
+  createdAt DateTime  @default(now())
+
+  website Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  @@index([websiteId, kind])
+  @@map("assets")
+}
+
+// ---------------------------------------------------------------- content planning
+
+model Cluster {
+  id        String   @id @default(cuid())
+  websiteId String
+  name      String
+  color     String?
+  createdAt DateTime @default(now())
+
+  website  Website   @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  keywords Keyword[]
+
+  @@unique([websiteId, name])
+  @@map("clusters")
+}
+
+model Keyword {
+  id         String        @id @default(cuid())
+  websiteId  String
+  clusterId  String?
+  term       String
+  volume     Int?
+  difficulty Int?
+  intent     String?
+  source     KeywordSource @default(RESEARCH)
+  createdAt  DateTime      @default(now())
+
+  website   Website           @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  cluster   Cluster?          @relation(fields: [clusterId], references: [id], onDelete: SetNull)
+  planItems ContentPlanItem[]
+
+  @@unique([websiteId, term])
+  @@index([websiteId, clusterId])
+  @@map("keywords")
+}
+
+model ContentPlanItem {
+  id           String         @id @default(cuid())
+  websiteId    String
+  keywordId    String?
+  scheduledFor DateTime       @db.Date
+  status       PlanItemStatus @default(QUEUED)
+  title        String?
+  articleType  ArticleType    @default(EXPLAINER)
+  instructions String?        @db.Text
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+
+  website  Website   @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  keyword  Keyword?  @relation(fields: [keywordId], references: [id], onDelete: SetNull)
+  articles Article[]
+
+  @@index([websiteId, scheduledFor])
+  @@index([websiteId, status])
+  @@map("content_plan_items")
+}
+
+// ---------------------------------------------------------------- articles
+
+model Article {
+  id              String        @id @default(cuid())
+  websiteId       String
+  planItemId      String?
+  status          ArticleStatus @default(DRAFT)
+  title           String
+  slug            String
+  bodyHtml        String        @db.Text
+  metaTitle       String?
+  metaDescription String?
+  jsonld          Json?
+  heroAssetId     String?
+  wordCount       Int?
+  model           String?
+  promptVersion   String?
+  // Approval trail. With `autoPublish` off by default, a human approves before publication, and
+  // the article has to say who and when — that is the provenance the dashboard shows.
+  approvedById    String?
+  approvedAt      DateTime?
+  wpPostId        Int?
+  publishedAt     DateTime?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  website    Website           @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  planItem   ContentPlanItem?  @relation(fields: [planItemId], references: [id], onDelete: SetNull)
+  approvedBy User?             @relation("ArticleApprovals", fields: [approvedById], references: [id], onDelete: SetNull)
+  revisions  ArticleRevision[]
+  socialAssets SocialAsset[]
+
+  @@unique([websiteId, slug])
+  @@index([websiteId, status])
+  @@map("articles")
+}
+
+model ArticleRevision {
+  id        String   @id @default(cuid())
+  articleId String
+  bodyHtml  String   @db.Text
+  reason    String
+  createdAt DateTime @default(now())
+
+  article Article @relation(fields: [articleId], references: [id], onDelete: Cascade)
+
+  @@index([articleId])
+  @@map("article_revisions")
+}
+
+// ---------------------------------------------------------------- site health
+
+model SiteScan {
+  id             String   @id @default(cuid())
+  websiteId      String
+  score          Int
+  pageSpeed      Int?
+  llmScore       Int?
+  technicalSeo   Int?
+  crawlerFiles   Json?
+  createdAt      DateTime @default(now())
+
+  website Website     @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  issues  SiteIssue[]
+
+  @@index([websiteId, createdAt])
+  @@map("site_scans")
+}
+
+model SiteIssue {
+  id       String        @id @default(cuid())
+  scanId   String
+  severity Severity
+  category IssueCategory
+  code     String
+  message  String
+  why      String?       @db.Text
+  howToFix String?       @db.Text
+  pages    Json?
+
+  scan SiteScan @relation(fields: [scanId], references: [id], onDelete: Cascade)
+
+  @@index([scanId])
+  @@map("site_issues")
+}
+
+// ---------------------------------------------------------------- AI visibility (GEO)
+
+model AiPrompt {
+  id        String   @id @default(cuid())
+  websiteId String
+  clusterId String?
+  prompt    String   @db.Text
+  enabled   Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  website Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  runs    AiRun[]
+
+  @@index([websiteId])
+  @@map("ai_prompts")
+}
+
+model AiRun {
+  id             String   @id @default(cuid())
+  promptId       String
+  model          String
+  brandMentioned Boolean  @default(false)
+  sentiment      Int?
+  answerExcerpt  String?  @db.Text
+  runAt          DateTime @default(now())
+
+  prompt    AiPrompt     @relation(fields: [promptId], references: [id], onDelete: Cascade)
+  citations AiCitation[]
+  brands    AiBrand[]
+
+  @@index([promptId, runAt])
+  @@map("ai_runs")
+}
+
+model AiCitation {
+  id     String @id @default(cuid())
+  runId  String
+  domain String
+  url    String?
+
+  run AiRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@index([runId])
+  @@map("ai_citations")
+}
+
+model AiBrand {
+  id        String @id @default(cuid())
+  runId     String
+  brand     String
+  sentiment Int?
+
+  run AiRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@index([runId])
+  @@map("ai_brands")
+}
+
+// ---------------------------------------------------------------- socials
+
+model SocialOpportunity {
+  id             String         @id @default(cuid())
+  websiteId      String
+  platform       SocialPlatform
+  externalId     String?
+  url            String
+  title          String
+  matchedKeyword String?
+  score          Int?
+  status         SocialStatus   @default(NEW)
+  draftReply     String?        @db.Text
+  publishedAt    DateTime?
+  createdAt      DateTime       @default(now())
+
+  website Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  @@unique([websiteId, platform, url])
+  @@index([websiteId, status])
+  @@map("social_opportunities")
+}
+
+model SocialAsset {
+  id           String         @id @default(cuid())
+  articleId    String
+  platform     SocialPlatform
+  variants     Json?
+  scheduledFor DateTime?
+  status       SocialStatus   @default(NEW)
+  createdAt    DateTime       @default(now())
+
+  article Article @relation(fields: [articleId], references: [id], onDelete: Cascade)
+
+  @@index([articleId])
+  @@map("social_assets")
+}
+
+// ---------------------------------------------------------------- backlinks
+
+model BacklinkAccount {
+  id           String   @id @default(cuid())
+  websiteId    String   @unique
+  credits      Int      @default(100)
+  domainRating Int      @default(0)
+  drUpdatedAt  DateTime?
+
+  website Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  @@map("backlink_accounts")
+}
+
+model BacklinkExchange {
+  id           String         @id @default(cuid())
+  websiteId    String
+  partnerDomain String
+  targetUrl    String
+  anchor       String?
+  status       BacklinkStatus @default(PROPOSED)
+  credits      Int            @default(0)
+  createdAt    DateTime       @default(now())
+
+  website Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  @@index([websiteId, status])
+  @@map("backlink_exchanges")
+}
+
+// ---------------------------------------------------------------- activity
+
+model ActivityLog {
+  id        String       @id @default(cuid())
+  websiteId String
+  actor     String       @default("agent")
+  kind      ActivityKind
+  payload   Json?
+  createdAt DateTime     @default(now())
+
+  website Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  @@index([websiteId, createdAt])
+  @@map("activity_log")
+}
